@@ -1,0 +1,14 @@
+ Remove-Item -Recurse -Force venv 
+ py -3.10 -m venv venv 
+ venv\Scripts\activate 
+ python --version 
+ Python 3.10.x 
+ cd C:\Projects\Naruto 
+ py -3.10 -m venv venv 
+ python collect_data.py  
+python naruto.py
+py -3.10 naruto.py
+predict_live
+python naruto1.py
+
+cd C:\Projects\python_game
