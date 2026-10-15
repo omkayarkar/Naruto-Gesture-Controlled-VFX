@@ -48,20 +48,41 @@ options = HandLandmarkerOptions(
 def normalize(label):
     return label.lower().replace(" ", "_")
 
-SEQUENCE = [
-    normalize("chakra_focus"),
-    normalize("chakra_rotate"),
-    normalize("rasengan_ready")
+RASENGAN_SEQUENCE = [
+    normalize("Chakra Focus"),
+    normalize("Chakra Rotate"),
+    normalize("Rasengan Ready")
+]
+CHIDORI_SEQUENCE = [
+    normalize("Chakra Focus"),
+    normalize("Lightning Chakra"),
+    normalize("Chidori Ready")
 ]
 
-sequence_index = 0
-sequence_start_time = None
-sequence_timeout = 6
+sequence_timeout = 6.0
 CONFIDENCE_THRESHOLD = 0.60
+sequence_states = {
+    "rasengan": {"sequence": RASENGAN_SEQUENCE, "index": 0, "start": None},
+    "chidori": {"sequence": CHIDORI_SEQUENCE, "index": 0, "start": None},
+}
 
 animation_active = False
 animation_start = 0
 animation_duration = 6.0
+
+chidori_video = cv2.VideoCapture("chidori.mp4")
+if not chidori_video.isOpened():
+    raise SystemExit("Could not open chidori.mp4")
+video_width = int(chidori_video.get(cv2.CAP_PROP_FRAME_WIDTH))
+video_height = int(chidori_video.get(cv2.CAP_PROP_FRAME_HEIGHT))
+if video_width <= 0 or video_height <= 0:
+    chidori_video.release()
+    raise SystemExit("Invalid chidori.mp4 dimensions")
+video_ratio = video_height / video_width
+chidori_sound = pygame.mixer.Sound("chidori.mp3")
+chidori_active = False
+chidori_start = 0.0
+
 
 # ==========================
 # Circular masked overlay
@@ -108,6 +129,55 @@ def overlay_circle(background, overlay, cx, cy, size, angle):
     return background
 
 # ==========================
+
+# Chidori green-screen overlay helpers
+def center_crop(frame, percent=0.45):
+    h, w = frame.shape[:2]
+    cw, ch = max(1, int(w * percent)), max(1, int(h * percent))
+    x, y = max(0, (w - cw) // 2), max(0, (h - ch) // 2)
+    return frame[y:y + ch, x:x + cw]
+
+
+def remove_green(frame):
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    mask_green = cv2.inRange(
+        hsv, np.array([35, 70, 70]), np.array([85, 255, 255])
+    )
+    kernel = np.ones((3, 3), np.uint8)
+    mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_OPEN, kernel)
+    mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_CLOSE, kernel)
+    alpha = cv2.GaussianBlur(
+        cv2.bitwise_not(mask_green), (5, 5), 0
+    ).astype(np.float32) / 255.0
+    b, g, r = cv2.split(frame)
+    g = np.minimum(g, np.maximum(r, b))
+    return cv2.merge((b, g, r)), alpha
+
+
+def overlay_video(frame, video_frame, cx, cy, scale_width):
+    video_frame = center_crop(video_frame, 0.45)
+    nw = max(1, int(scale_width))
+    nh = max(1, int(nw * video_ratio))
+    video_frame = cv2.resize(video_frame, (nw, nh), interpolation=cv2.INTER_CUBIC)
+    processed, alpha = remove_green(video_frame)
+
+    h, w = frame.shape[:2]
+    x = cx - nw // 2 + random.randint(-6, 6)
+    y = cy - nh // 2 - int(nh * 0.15) + random.randint(-6, 6)
+    x1, x2 = max(0, x), min(w, x + nw)
+    y1, y2 = max(0, y), min(h, y + nh)
+    if x1 >= x2 or y1 >= y2:
+        return frame
+
+    crop = processed[y1-y:y2-y, x1-x:x2-x].astype(np.float32)
+    a = alpha[y1-y:y2-y, x1-x:x2-x, None]
+    region = frame[y1:y2, x1:x2].astype(np.float32)
+    blended = a * crop + (1.0 - a) * region
+    glow = cv2.GaussianBlur(crop, (21, 21), 0)
+    frame[y1:y2, x1:x2] = np.clip(blended + glow * a * 0.25, 0, 255).astype(np.uint8)
+    return frame
+
+
 # Camera
 # ==========================
 cap = cv2.VideoCapture(0)
@@ -132,10 +202,20 @@ with HandLandmarker.create_from_options(options) as landmarker:
         result = landmarker.detect_for_video(mp_image, timestamp)
 
         current_time = time.time()
+        chidori_center = None
+        dynamic_width = 400
 
         if result.hand_landmarks:
             hand_landmarks = result.hand_landmarks[0]
             h, w, _ = frame.shape
+            xs = [int(lm.x * w) for lm in hand_landmarks]
+            ys = [int(lm.y * h) for lm in hand_landmarks]
+            hand_diagonal = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+            dynamic_width = max(350, min(int(hand_diagonal * 6.5), 1000))
+            chidori_center = (
+                int(hand_landmarks[9].x * w),
+                int(hand_landmarks[9].y * h)
+            )
 
             landmarks = []
             for lm in hand_landmarks:
@@ -152,25 +232,39 @@ with HandLandmarker.create_from_options(options) as landmarker:
             prediction = normalize(raw_prediction)
 
             if confidence >= CONFIDENCE_THRESHOLD:
-                if sequence_index == 0:
-                    sequence_start_time = current_time
+                for effect_name, state in sequence_states.items():
+                    seq = state["sequence"]
+                    idx = state["index"]
 
-                if sequence_start_time and current_time - sequence_start_time <= sequence_timeout:
-                    if prediction == SEQUENCE[sequence_index]:
-                        sequence_index += 1
-                        time.sleep(0.25)
-                else:
-                    sequence_index = 0
-                    sequence_start_time = None
+                    if state["start"] is not None and current_time - state["start"] > sequence_timeout:
+                        state["index"] = 0
+                        state["start"] = None
+                        idx = 0
 
-            if sequence_index == len(SEQUENCE):
-                animation_active = True
-                animation_start = current_time
-                sequence_index = 0
-                sequence_start_time = None
+                    if prediction == seq[idx]:
+                        if idx == 0:
+                            state["start"] = current_time
+                        state["index"] += 1
 
-                pygame.mixer.music.stop()
-                pygame.mixer.music.play()
+                        if state["index"] == len(seq):
+                            state["index"] = 0
+                            state["start"] = None
+
+                            if effect_name == "rasengan":
+                                animation_active = True
+                                animation_start = current_time
+                                pygame.mixer.music.stop()
+                                pygame.mixer.music.play()
+                            else:
+                                chidori_active = True
+                                chidori_start = current_time
+                                chidori_video.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                                chidori_sound.stop()
+                                chidori_sound.play()
+
+                    elif prediction == seq[0]:
+                        state["index"] = 1
+                        state["start"] = current_time
 
             if animation_active:
 
@@ -216,12 +310,29 @@ with HandLandmarker.create_from_options(options) as landmarker:
                 else:
                     animation_active = False
 
+        if chidori_active:
+            if current_time - chidori_start >= animation_duration:
+                chidori_active = False
+                chidori_sound.stop()
+            elif chidori_center is not None:
+                ok, video_frame = chidori_video.read()
+                if not ok:
+                    chidori_video.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ok, video_frame = chidori_video.read()
+                if ok:
+                    frame = overlay_video(
+                        frame, video_frame,
+                        chidori_center[0], chidori_center[1],
+                        dynamic_width
+                    )
+
         cv2.imshow("Naruto AI - Stable Rasengan", frame)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
 cap.release()
+chidori_video.release()
 cv2.destroyAllWindows()
 pygame.quit()
 
